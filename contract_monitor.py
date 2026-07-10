@@ -792,15 +792,17 @@ class UsaSpendingCache:
                 "tier": "toptier",
                 "name": agency_name,
             }]
+        # NOTE: contract-award result mappings use "Start Date" (not
+        # "Action Date") — sorting by anything else returns HTTP 400.
         body = {
             "filters": filters,
             "fields": [
                 "Award ID", "Recipient Name", "Award Amount",
-                "Action Date", "Description", "Awarding Agency",
+                "Start Date", "Description", "Awarding Agency",
             ],
             "page": 1,
             "limit": max(1, self._limit),
-            "sort": "Action Date",
+            "sort": "Start Date",
             "order": "desc",
             "subawards": False,
         }
@@ -816,7 +818,7 @@ class UsaSpendingCache:
             out.append({
                 "recipient": r.get("Recipient Name") or "",
                 "amount": _safe_float(r.get("Award Amount")),
-                "action_date": (r.get("Action Date") or "")[:10],
+                "action_date": (r.get("Start Date") or "")[:10],
                 "contract_number": r.get("Award ID") or "",
                 "description": (r.get("Description") or "")[:400],
                 "agency": r.get("Awarding Agency") or "",
