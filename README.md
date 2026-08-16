@@ -49,7 +49,29 @@ urgency, local-only, set-aside-only, and free-text search. A systemd unit
 example (survives reboots) and a Chromium `--kiosk` note for an always-on
 display are in the docstring at the top of `contract_monitor.py`.
 
-## SMS alerts (optional)
+## Email digest (primary alert channel)
+
+Stdlib `smtplib` — zero extra dependencies. Each daily run sends a rich HTML
+briefing with:
+
+- **Price-point bars** — what similar contracts actually went for
+  (USAspending), plus a min/median/max **bid window** per opportunity
+- **📅 deadlines.ics attached** — every deadline lands in Apple/Google/Outlook
+  calendar as an all-day event with a 2-day-before reminder, plus one-click
+  "Add to Google Calendar" links per card
+- **✉️ Pre-filled officer drafts** — mailto links to each contracting officer
+  with the subject and capability-statement intro already written
+- NEW TODAY / Local Advantage / Strong Incumbent badges, color-coded
+  countdowns, bid-prep checklists, and the full report + CSV attached
+- Urgent days are flagged high-priority so they surface in your inbox
+
+Setup (Gmail App Password steps are in the file header), then verify with:
+
+```bash
+python3 contract_monitor.py --email-test
+```
+
+## SMS alerts (optional fallback)
 
 Twilio (plain `requests` POST, no SDK) with a Textbelt fallback. Alerts fire
 only on newly-seen opportunities that beat `min_match_score` or are due within
@@ -75,7 +97,8 @@ header; enable with `sms_enabled: true` in `config.yaml`.
 --dry-run          Fetch + classify, no DB/report/SMS writes
 --csv              Also write sorted CSV
 --serve            Start the always-on dashboard (--host/--port)
---config/--db/--reports-dir/--lookback/--no-sms/--verbose
+--email-test       Send a test email to verify SMTP creds
+--config/--db/--reports-dir/--lookback/--no-email/--no-sms/--verbose
 ```
 
 ## Customizing

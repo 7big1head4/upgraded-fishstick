@@ -27,7 +27,43 @@ SAM.gov PUBLIC API KEY — setup steps
    sleeps between page fetches and USAspending calls to stay polite.
 
 ----------------------------------------------------------------------
-TWILIO SMS (optional, recommended)
+EMAIL ALERTS (recommended primary channel — stdlib smtplib, no deps)
+----------------------------------------------------------------------
+Sends a rich HTML daily digest with:
+  • per-opportunity cards sorted by Actionability Score, with color-coded
+    deadline countdowns, Local Advantage / Strong Incumbent badges
+  • prior-award PRICE-POINT BARS + a "bid window" (min / median / max of
+    what similar contracts actually went for)
+  • one-click 📅 "Add to Google Calendar" links per deadline, PLUS an
+    attached deadlines.ics (every deadline as an all-day event with a
+    2-day-before reminder — opens in Apple/Google/Outlook calendar)
+  • ✉️ pre-filled mailto: drafts to each contracting officer (subject +
+    capability-statement intro already written — just hit send)
+  • the daily Markdown report and CSV attached
+  • urgent runs flagged high-priority so they surface in your inbox
+
+Gmail setup (easiest):
+1. Enable 2-Step Verification on your Google account.
+2. Create an App Password: https://myaccount.google.com/apppasswords
+   (choose "Mail", copy the 16-char password).
+3. In config.yaml:
+       email:
+         enabled: true
+         smtp_host: "smtp.gmail.com"
+         smtp_port: 465
+         smtp_user: "you@gmail.com"
+         smtp_password: ""            # or export EMAIL_PASSWORD instead
+         from_addr: "you@gmail.com"
+         to_addrs: ["you@gmail.com"]
+4. Or export EMAIL_PASSWORD=xxxx in the cron env — env wins over config.
+Any SMTP provider works (Fastmail, Outlook, self-hosted) — just change
+host/port. Port 465 = SSL, 587 = STARTTLS (auto-detected).
+
+Test it any time without a fetch:
+    python3 contract_monitor.py --email-test
+
+----------------------------------------------------------------------
+TWILIO SMS (optional fallback channel)
 ----------------------------------------------------------------------
 1. Free trial account at https://www.twilio.com/try-twilio
 2. Console → grab Account SID and Auth Token from the top card.
@@ -134,6 +170,8 @@ CLI
     --db PATH          Override DB path
     --reports-dir PATH Override reports directory
     --lookback N       Override lookback_days for this run
+    --email-test       Send a test email (verifies SMTP creds, no SAM fetch)
+    --no-email         Force email digest off for this run
     --no-sms           Force SMS disabled for this run
     --verbose          DEBUG logging
 """
@@ -362,7 +400,37 @@ polite:
   max_retries: 4
 
 # ------------------------------------------------------------------
-# SMS / Text alerts (optional). Both providers work over plain requests.
+# Email alerts (primary channel). Stdlib smtplib — zero extra deps.
+# Gmail: use an App Password (see file header). Password can also come
+# from the EMAIL_PASSWORD env var (env wins).
+# ------------------------------------------------------------------
+email:
+  enabled: false
+  smtp_host: "smtp.gmail.com"
+  smtp_port: 465               # 465 = SSL, 587 = STARTTLS (auto-detected)
+  smtp_user: "midbonj@gmail.com"
+  smtp_password: ""            # leave blank + export EMAIL_PASSWORD instead
+  from_addr: "midbonj@gmail.com"
+  to_addrs:
+    - "midbonj@gmail.com"
+  # What goes in the email:
+  top_n: 15                    # max opportunity cards in the digest
+  only_when_new: false         # true = skip the email on days with 0 new opps
+  attach_report: true          # attach daily_YYYY-MM-DD.md
+  attach_csv: true             # attach the CSV when --csv is used
+  attach_ics: true             # attach deadlines.ics (calendar events + reminders)
+  # EDIT: pre-filled intro used for the one-click mailto: drafts to
+  # contracting officers. {title} {sol} {company} are substituted.
+  officer_intro: >
+    Good morning — regarding {title} (Solicitation {sol}): {company} is an
+    experienced local contractor and we would welcome the opportunity to be
+    considered. Could you confirm the submission requirements and add us to
+    the interested-vendors list? A capability statement is available on
+    request. Thank you.
+  company_name: "Your Company LLC"    # EDIT: used in the officer intro
+
+# ------------------------------------------------------------------
+# SMS / Text alerts (optional fallback). Both providers use plain requests.
 # ------------------------------------------------------------------
 sms_enabled: false
 sms_provider: "twilio"          # or "textbelt"
@@ -467,6 +535,30 @@ def load_config(path: Path) -> Dict[str, Any]:
     cfg.setdefault("sms_provider", "twilio")
     cfg.setdefault("sms_deadline_days", 10)
     cfg.setdefault("sms_max_per_run", 5)
+    em = cfg.setdefault("email", {})
+    em.setdefault("enabled", False)
+    em.setdefault("smtp_host", "smtp.gmail.com")
+    em.setdefault("smtp_port", 465)
+    em.setdefault("smtp_user", "")
+    em.setdefault("smtp_password", "")
+    em.setdefault("from_addr", em.get("smtp_user", ""))
+    em.setdefault("to_addrs", [])
+    em.setdefault("top_n", 15)
+    em.setdefault("only_when_new", False)
+    em.setdefault("attach_report", True)
+    em.setdefault("attach_csv", True)
+    em.setdefault("attach_ics", True)
+    em.setdefault("company_name", "Your Company LLC")
+    em.setdefault(
+        "officer_intro",
+        "Good morning — regarding {title} (Solicitation {sol}): {company} is an "
+        "experienced local contractor and we would welcome the opportunity to be "
+        "considered. Could you confirm the submission requirements and add us to "
+        "the interested-vendors list? Thank you.",
+    )
+    env_pw = os.environ.get("EMAIL_PASSWORD")
+    if env_pw:
+        em["smtp_password"] = env_pw
     dash = cfg.setdefault("dashboard", {})
     dash.setdefault("host", "0.0.0.0")
     dash.setdefault("port", 8080)
@@ -1263,6 +1355,332 @@ def maybe_send_alerts(cfg: Dict[str, Any], new_alerts: List[Opportunity]) -> Non
 
 
 # --------------------------------------------------------------------------- #
+# Email alerts — stdlib smtplib. Rich HTML digest + calendar + officer drafts.
+# --------------------------------------------------------------------------- #
+
+import smtplib
+import ssl
+from email.message import EmailMessage
+from email.utils import formatdate, make_msgid
+from html import escape as _h
+from urllib.parse import quote as _q
+
+
+def _gcal_link(opp: Opportunity) -> str:
+    """One-click 'Add to Google Calendar' URL for the response deadline."""
+    d = parse_date(opp.response_deadline)
+    if not d:
+        return ""
+    start = d.strftime("%Y%m%d")
+    end = (d + timedelta(days=1)).strftime("%Y%m%d")
+    title = f"BID DUE: {opp.title[:80]}"
+    details = f"Sol# {opp.sol_number or 'n/a'}\n{opp.url}"
+    return (
+        "https://calendar.google.com/calendar/render?action=TEMPLATE"
+        f"&text={_q(title)}&dates={start}/{end}&details={_q(details)}"
+    )
+
+
+def _officer_mailto(opp: Opportunity, cfg: Dict[str, Any]) -> str:
+    """Pre-filled mailto: draft to the contracting officer — just hit send."""
+    if not opp.contact_email:
+        return ""
+    em = cfg.get("email", {}) or {}
+    subject = f"Interested Vendor — {opp.sol_number or opp.title[:60]}"
+    body = str(em.get("officer_intro", "")).format(
+        title=opp.title, sol=opp.sol_number or "n/a",
+        company=em.get("company_name", "Your Company LLC"),
+    )
+    return f"mailto:{opp.contact_email}?subject={_q(subject)}&body={_q(body)}"
+
+
+def build_ics(opps: List[Opportunity]) -> str:
+    """
+    deadlines.ics — every deadline as an all-day VEVENT with a reminder
+    2 days before. Opens directly in Apple / Google / Outlook calendars.
+    """
+    now = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+    lines = [
+        "BEGIN:VCALENDAR",
+        "VERSION:2.0",
+        "PRODID:-//contract-monitor//bid-deadlines//EN",
+        "CALSCALE:GREGORIAN",
+        "METHOD:PUBLISH",
+    ]
+    def _esc(s: str) -> str:
+        return s.replace("\\", "\\\\").replace(";", r"\;").replace(",", r"\,").replace("\n", r"\n")
+    for o in opps:
+        d = parse_date(o.response_deadline)
+        if not d:
+            continue
+        lines += [
+            "BEGIN:VEVENT",
+            f"UID:{o.notice_id}@contract-monitor",
+            f"DTSTAMP:{now}",
+            f"DTSTART;VALUE=DATE:{d.strftime('%Y%m%d')}",
+            f"DTEND;VALUE=DATE:{(d + timedelta(days=1)).strftime('%Y%m%d')}",
+            f"SUMMARY:{_esc('BID DUE: ' + (o.title or o.notice_id)[:100])}",
+            "DESCRIPTION:" + _esc(
+                f"Sol# {o.sol_number or 'n/a'} | Action {o.actionability_score} | {o.url}"
+            ),
+            f"URL:{o.url}",
+            "BEGIN:VALARM",
+            "ACTION:DISPLAY",
+            f"DESCRIPTION:{_esc('Bid due in 2 days: ' + (o.title or '')[:80])}",
+            "TRIGGER:-P2D",
+            "END:VALARM",
+            "END:VEVENT",
+        ]
+    lines.append("END:VCALENDAR")
+    return "\r\n".join(lines) + "\r\n"
+
+
+def _bid_window(prior: List[Dict[str, Any]]) -> str:
+    """'Bid window: $9.6k – $89.6k – $207.7k (min/median/max)' from priors."""
+    amounts = sorted(a for a in (_safe_float(p.get("amount")) for p in prior) if a > 0)
+    if not amounts:
+        return ""
+    med = amounts[len(amounts) // 2]
+    return f"{_fmt_money(amounts[0])} – {_fmt_money(med)} – {_fmt_money(amounts[-1])}"
+
+
+def _email_opp_card(opp: Opportunity, cfg: Dict[str, Any], is_new: bool) -> str:
+    """One opportunity card. Inline styles only — survives Gmail/Outlook."""
+    dleft = _days_left(opp.response_deadline)
+    if dleft is None:
+        dl_txt, dl_color = "TBD", "#888"
+    elif dleft < 0:
+        dl_txt, dl_color = f"{opp.response_deadline} (overdue)", "#b91c1c"
+    elif dleft <= 3:
+        dl_txt, dl_color = f"{opp.response_deadline} — {dleft}d left", "#dc2626"
+    elif dleft <= 7:
+        dl_txt, dl_color = f"{opp.response_deadline} — {dleft}d left", "#d97706"
+    else:
+        dl_txt, dl_color = f"{opp.response_deadline} — {dleft}d left", "#16a34a"
+
+    sc = opp.actionability_score
+    sc_color = "#16a34a" if sc >= 70 else "#d97706" if sc >= 40 else "#6b7280"
+
+    badges = []
+    if is_new:
+        badges.append('<span style="background:#7c3aed;color:#fff;padding:2px 8px;border-radius:4px;font-size:11px;font-weight:bold">NEW TODAY</span>')
+    if opp.local_advantage:
+        badges.append('<span style="background:#16a34a;color:#fff;padding:2px 8px;border-radius:4px;font-size:11px;font-weight:bold">🏠 LOCAL ADVANTAGE</span>')
+    if opp.set_aside:
+        badges.append(f'<span style="background:#2563eb;color:#fff;padding:2px 8px;border-radius:4px;font-size:11px;font-weight:bold">🛡 {_h(opp.set_aside[:40])}</span>')
+    if opp.strong_incumbent:
+        badges.append(f'<span style="background:#d97706;color:#fff;padding:2px 8px;border-radius:4px;font-size:11px;font-weight:bold">⚠️ INCUMBENT: {_h(opp.strong_incumbent[:30])}</span>')
+
+    # Prior-award price-point bars (table-based; email-client-safe).
+    prior_html = ""
+    priced = [p for p in opp.prior_summary[:5] if _safe_float(p.get("amount")) > 0]
+    if priced:
+        mx = max(_safe_float(p["amount"]) for p in priced)
+        rows = []
+        for p in priced:
+            amt = _safe_float(p["amount"])
+            pct = max(4, int(amt / mx * 100))
+            rows.append(
+                '<tr>'
+                f'<td style="font-size:11px;color:#555;padding:1px 8px 1px 0;white-space:nowrap">{_h((p.get("recipient") or "?")[:34])}</td>'
+                f'<td style="width:220px;padding:1px 0"><div style="background:#3b82f6;height:10px;width:{pct}%;border-radius:3px"></div></td>'
+                f'<td style="font-size:11px;color:#111;padding:1px 0 1px 8px;white-space:nowrap"><b>{_fmt_money(amt)}</b> <span style="color:#888">{_h((p.get("action_date") or "")[:10])}</span></td>'
+                '</tr>'
+            )
+        window = _bid_window(opp.prior_summary)
+        prior_html = (
+            f'<div style="margin-top:8px;font-size:12px;color:#333"><b>What similar work went for</b>'
+            + (f' &nbsp;·&nbsp; bid window: <b>{_h(window)}</b>' if window else "")
+            + f'</div><table cellpadding="0" cellspacing="0" style="margin-top:4px">{"".join(rows)}</table>'
+        )
+
+    checklist_html = ""
+    if opp.checklist:
+        items = "".join(f'<li style="margin:2px 0">{_h(c)}</li>' for c in opp.checklist[:6])
+        checklist_html = (
+            f'<div style="margin-top:8px;font-size:12px"><b>Bid-prep checklist</b>'
+            f'<ul style="margin:4px 0 0 18px;padding:0;color:#333">{items}</ul></div>'
+        )
+
+    actions = [f'<a href="{_h(opp.url)}" style="color:#2563eb;font-weight:bold;text-decoration:none">View on SAM.gov →</a>']
+    gcal = _gcal_link(opp)
+    if gcal:
+        actions.append(f'<a href="{_h(gcal)}" style="color:#2563eb;text-decoration:none">📅 Add deadline to Google Calendar</a>')
+    mailto = _officer_mailto(opp, cfg)
+    if mailto:
+        actions.append(f'<a href="{_h(mailto)}" style="color:#2563eb;text-decoration:none">✉️ Email {_h(opp.contact_name or "contracting officer")} (pre-filled)</a>')
+
+    pop = ", ".join(x for x in [opp.pop_city, opp.pop_state] if x) or "n/a"
+    return f"""
+<div style="border:1px solid #e5e7eb;border-radius:8px;padding:14px 16px;margin:0 0 12px;background:#ffffff">
+  <div style="display:block">
+    <span style="background:{sc_color};color:#fff;padding:3px 10px;border-radius:5px;font-weight:bold;font-size:14px">{sc}</span>
+    <a href="{_h(opp.url)}" style="font-size:15px;font-weight:bold;color:#111;text-decoration:none">&nbsp;{_h(opp.title or '(untitled)')}</a>
+  </div>
+  <div style="margin-top:6px">{' '.join(badges)}</div>
+  <div style="margin-top:8px;font-size:12px;color:#555">
+    {_h(opp.agency or '?')} &nbsp;·&nbsp; NAICS {_h(opp.naics_code)} ({_h(opp.sector)}) &nbsp;·&nbsp; 📍 {_h(pop)} &nbsp;·&nbsp; Sol# {_h(opp.sol_number or '—')}
+  </div>
+  <div style="margin-top:6px;font-size:13px">Deadline: <b style="color:{dl_color}">{_h(dl_txt)}</b>
+    &nbsp;·&nbsp; Match {opp.match_score} &nbsp;·&nbsp; Value {_h(opp.value_bucket)}</div>
+  {prior_html}
+  {checklist_html}
+  <div style="margin-top:10px;font-size:12px">{' &nbsp;|&nbsp; '.join(actions)}</div>
+</div>"""
+
+
+def build_email_html(top: List[Opportunity], new_ids: set, cfg: Dict[str, Any],
+                     total_active: int) -> str:
+    today = date.today().strftime("%A, %B %d, %Y")
+    n_new = sum(1 for o in top if o.notice_id in new_ids)
+    n_urgent = sum(1 for o in top if o.urgency >= 4)
+    cards = "".join(_email_opp_card(o, cfg, o.notice_id in new_ids) for o in top)
+    return f"""<!DOCTYPE html>
+<html><body style="margin:0;padding:0;background:#f3f4f6;font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif">
+<div style="max-width:680px;margin:0 auto;padding:16px">
+  <div style="background:#111827;border-radius:8px;padding:16px 20px;color:#fff">
+    <div style="font-size:18px;font-weight:bold">📋 Daily Contract Brief</div>
+    <div style="font-size:12px;color:#9ca3af;margin-top:2px">{_h(today)}</div>
+    <div style="margin-top:10px;font-size:13px">
+      <b style="color:#a78bfa">{n_new} new today</b> &nbsp;·&nbsp;
+      <b style="color:#f87171">{n_urgent} urgent</b> &nbsp;·&nbsp;
+      {total_active} active tracked &nbsp;·&nbsp; showing top {len(top)} by actionability
+    </div>
+  </div>
+  <div style="height:12px"></div>
+  {cards if cards else '<div style="background:#fff;border-radius:8px;padding:24px;text-align:center;color:#888">No active opportunities matched today.</div>'}
+  <div style="font-size:11px;color:#9ca3af;text-align:center;padding:8px 0 16px">
+    contract_monitor.py · deadlines.ics attached — open it to load every deadline
+    into your calendar with 2-day reminders · full report attached
+  </div>
+</div>
+</body></html>"""
+
+
+def send_email(cfg: Dict[str, Any], subject: str, html_body: str, text_body: str,
+               attachments: Optional[List[Tuple[str, bytes, str, str]]] = None,
+               high_priority: bool = False) -> bool:
+    """attachments: list of (filename, data, maintype, subtype)."""
+    em = cfg.get("email", {}) or {}
+    host = em.get("smtp_host") or ""
+    port = int(em.get("smtp_port") or 465)
+    user = em.get("smtp_user") or ""
+    password = em.get("smtp_password") or ""
+    from_addr = em.get("from_addr") or user
+    to_addrs = [a for a in (em.get("to_addrs") or []) if a]
+    if not (host and user and password and to_addrs):
+        LOG.warning("Email: smtp_host/smtp_user/smtp_password/to_addrs incomplete; skipping.")
+        return False
+
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = from_addr
+    msg["To"] = ", ".join(to_addrs)
+    msg["Date"] = formatdate(localtime=True)
+    msg["Message-ID"] = make_msgid(domain="contract-monitor.local")
+    if high_priority:
+        msg["X-Priority"] = "1"
+        msg["Importance"] = "high"
+    msg.set_content(text_body)
+    msg.add_alternative(html_body, subtype="html")
+    for fname, data, maintype, subtype in attachments or []:
+        msg.add_attachment(data, maintype=maintype, subtype=subtype, filename=fname)
+
+    try:
+        if port == 465:
+            with smtplib.SMTP_SSL(host, port, context=ssl.create_default_context(),
+                                  timeout=HTTP_TIMEOUT) as s:
+                s.login(user, password)
+                s.send_message(msg)
+        else:  # 587 / 25 → STARTTLS
+            with smtplib.SMTP(host, port, timeout=HTTP_TIMEOUT) as s:
+                s.starttls(context=ssl.create_default_context())
+                s.login(user, password)
+                s.send_message(msg)
+        LOG.info("Email sent → %s (%s)", ", ".join(to_addrs), subject)
+        return True
+    except (smtplib.SMTPException, OSError) as exc:
+        LOG.error("Email send failed: %s", exc)
+        return False
+
+
+def maybe_send_email_digest(cfg: Dict[str, Any], conn: sqlite3.Connection,
+                            new_alerts: List[Opportunity],
+                            report_path: Optional[Path],
+                            csv_path: Optional[Path]) -> None:
+    em = cfg.get("email", {}) or {}
+    if not em.get("enabled"):
+        LOG.info("Email disabled in config.")
+        return
+    if em.get("only_when_new") and not new_alerts:
+        LOG.info("Email: only_when_new set and nothing new — skipping digest.")
+        return
+
+    opps = _fetch_active(conn)
+    top = opps[: int(em.get("top_n", 15))]
+    new_ids = {o.notice_id for o in new_alerts}
+    n_new = sum(1 for o in top if o.notice_id in new_ids)
+    urgent_top = [o for o in top if o.urgency >= 4]
+
+    # Subject that reads like a briefing, not a cron job.
+    best = top[0] if top else None
+    bits = []
+    if n_new:
+        bits.append(f"{n_new} new")
+    if urgent_top:
+        nearest = min((_days_left(o.response_deadline) or 99) for o in urgent_top)
+        bits.append(f"closest due in {nearest}d")
+    if best:
+        bits.append(f"top: {best.title[:45]}")
+    subject = "🔥 Contract Brief — " + " · ".join(bits) if bits else \
+              f"📋 Contract Brief — {len(opps)} active tracked"
+
+    text_lines = [f"Daily Contract Brief — {date.today().isoformat()}", ""]
+    for o in top:
+        text_lines.append(
+            f"[{o.actionability_score}] {o.title} | due {o.response_deadline or 'TBD'} | {o.url}"
+        )
+    html = build_email_html(top, new_ids, cfg, total_active=len(opps))
+
+    attachments: List[Tuple[str, bytes, str, str]] = []
+    if em.get("attach_ics", True) and top:
+        attachments.append(("deadlines.ics", build_ics(top).encode("utf-8"), "text", "calendar"))
+    if em.get("attach_report", True) and report_path and report_path.exists():
+        attachments.append((report_path.name, report_path.read_bytes(), "text", "markdown"))
+    if em.get("attach_csv", True) and csv_path and csv_path.exists():
+        attachments.append((csv_path.name, csv_path.read_bytes(), "text", "csv"))
+
+    send_email(cfg, subject, html, "\n".join(text_lines), attachments,
+               high_priority=bool(urgent_top))
+
+
+def send_test_email(cfg: Dict[str, Any]) -> bool:
+    """--email-test: verify SMTP creds without touching SAM/DB."""
+    fake = Opportunity(
+        notice_id="test-000", title="TEST — Fleet Vehicle Maintenance Services",
+        sol_number="TEST-26-R-0001", posted_date=date.today().isoformat(),
+        response_deadline=(date.today() + timedelta(days=6)).isoformat(),
+        naics_code="811111", set_aside="Total Small Business Set-Aside",
+        agency="TEST AGENCY", pop_city="Whittier", pop_state="CA",
+        contact_name="Test Officer", contact_email="officer@example.com",
+        url="https://sam.gov", sector="Other Services (repair, maintenance, personal)",
+        urgency=4, value_bucket="M", match_score=85, local_advantage=True,
+        actionability_score=91,
+        checklist=["Confirm bonding capacity meets stated limits."],
+        prior_summary=[
+            {"recipient": "EXAMPLE CO", "amount": 120000, "action_date": "2026-01-15", "contract_number": "TEST123"},
+            {"recipient": "SAMPLE LLC", "amount": 45000, "action_date": "2025-11-02", "contract_number": "TEST456"},
+        ],
+    )
+    html = build_email_html([fake], {"test-000"}, cfg, total_active=1)
+    ok = send_email(cfg, "✅ contract_monitor test email — you're wired up",
+                    html, "contract_monitor test email — config works.",
+                    [("deadlines.ics", build_ics([fake]).encode("utf-8"), "text", "calendar")])
+    print("Test email sent." if ok else "Test email FAILED — check log above.")
+    return ok
+
+
+# --------------------------------------------------------------------------- #
 # Report generation
 # --------------------------------------------------------------------------- #
 
@@ -1634,9 +2052,15 @@ def run_update(cfg: Dict[str, Any], args: argparse.Namespace) -> None:
         return
 
     reports_dir = Path(args.reports_dir or cfg["paths"]["reports_dir"])
-    render_markdown(conn, reports_dir / f"daily_{today_iso}.md", cfg)
+    report_path = render_markdown(conn, reports_dir / f"daily_{today_iso}.md", cfg)
+    csv_path: Optional[Path] = None
     if args.csv:
-        export_csv(conn, reports_dir / f"daily_{today_iso}.csv")
+        csv_path = export_csv(conn, reports_dir / f"daily_{today_iso}.csv")
+
+    if not args.no_email:
+        maybe_send_email_digest(cfg, conn, new_alerts, report_path, csv_path)
+    else:
+        LOG.info("Email disabled (--no-email).")
 
     if cfg.get("sms_enabled") and not args.no_sms:
         maybe_send_alerts(cfg, new_alerts)
@@ -1999,6 +2423,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--db", default=None, help="Override SQLite DB path.")
     p.add_argument("--reports-dir", default=None, help="Override reports output directory.")
     p.add_argument("--lookback", type=int, default=None, help="Override lookback_days.")
+    p.add_argument("--no-email", action="store_true", help="Force email digest off for this run.")
+    p.add_argument("--email-test", action="store_true",
+                   help="Send a test email (verifies SMTP creds; no SAM fetch).")
     p.add_argument("--no-sms", action="store_true", help="Force SMS disabled for this run.")
     p.add_argument("--verbose", action="store_true", help="DEBUG-level logging.")
     return p
@@ -2013,6 +2440,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
     cfg = load_config(Path(args.config))
     try:
+        if args.email_test:
+            return 0 if send_test_email(cfg) else 1
         if args.serve:
             run_dashboard(cfg, args)
         elif args.report_only:
