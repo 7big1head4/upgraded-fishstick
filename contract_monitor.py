@@ -82,31 +82,34 @@ TWILIO SMS (optional fallback channel)
    "textbelt"` (or your paid key).
 
 ----------------------------------------------------------------------
-INSTALL
+INSTALL  (one command does everything — deps, cron, dashboard service)
 ----------------------------------------------------------------------
+    git clone https://github.com/7big1head4/upgraded-fishstick.git ~/contract
+    cd ~/contract
+    ./install.sh                 # interactive: installs deps + daily cron
+    # See install.sh --help for flags (custom time, dashboard, etc.)
+
+    # Manual install instead:
     sudo apt-get install -y python3-pip sqlite3
     pip3 install --user requests pyyaml
-    # Optional (for future county scrapers):
-    # pip3 install --user beautifulsoup4
 
 ----------------------------------------------------------------------
 FIRST RUN
 ----------------------------------------------------------------------
-    cd /home/pi/contract
+    cd ~/contract
     python3 contract_monitor.py --update --lookback 30
     # First run auto-creates config.yaml — edit it and re-run.
 
 ----------------------------------------------------------------------
-CRON EXAMPLE (crontab -e)
+CRON EXAMPLE (crontab -e)  — install.sh writes this for you
 ----------------------------------------------------------------------
-    # Daily at 06:15 local time.
-    15 6 * * * cd /home/pi/contract && \\
-        SAM_API_KEY=xxxxxxx /usr/bin/python3 contract_monitor.py --update --csv \\
+    # Daily at 06:15 local time. --self-update pulls the latest code first,
+    # so the Pi upgrades itself every morning before the run.
+    15 6 * * * . $HOME/.sam_env && cd $HOME/contract && \\
+        /usr/bin/python3 contract_monitor.py --self-update --update --csv \\
         >> monitor.log 2>&1
 
-    # Or source the key from a file kept 0600:
-    15 6 * * * . /home/pi/.sam_env && cd /home/pi/contract && \\
-        /usr/bin/python3 contract_monitor.py --update >> monitor.log 2>&1
+    # Drop --self-update if you'd rather pin the version and upgrade manually.
 
 ----------------------------------------------------------------------
 ALWAYS-ON DASHBOARD (RPi5 kiosk, browser, or phone on LAN)
@@ -173,6 +176,7 @@ CLI
     --email-test       Send a test email (verifies SMTP creds, no SAM fetch)
     --no-email         Force email digest off for this run
     --no-sms           Force SMS disabled for this run
+    --self-update      git pull --ff-only before running (keeps cron current)
     --verbose          DEBUG logging
 """
 
@@ -2397,6 +2401,62 @@ def run_dashboard(cfg: Dict[str, Any], args: argparse.Namespace) -> None:
 # CLI
 # --------------------------------------------------------------------------- #
 
+# --------------------------------------------------------------------------- #
+# Self-update — keep the tool current straight from the cron job.
+# --------------------------------------------------------------------------- #
+
+import subprocess
+
+
+def self_update() -> bool:
+    """
+    `git pull --ff-only` in the script's own directory so the daily cron
+    run always executes the latest code. Safe to call before every run:
+    - no-ops cleanly if there's nothing to pull or no network
+    - refuses to touch a dirty tree (won't clobber local edits)
+    Returns True if new commits were pulled.
+    """
+    here = Path(__file__).resolve().parent
+    if not (here / ".git").exists():
+        LOG.info("self-update: not a git checkout (%s) — skipping.", here)
+        return False
+    try:
+        # Abort if there are uncommitted changes to tracked files.
+        dirty = subprocess.run(
+            ["git", "-C", str(here), "status", "--porcelain", "--untracked-files=no"],
+            capture_output=True, text=True, timeout=30,
+        )
+        if dirty.stdout.strip():
+            LOG.warning("self-update: local changes present — skipping git pull.")
+            return False
+        before = subprocess.run(
+            ["git", "-C", str(here), "rev-parse", "HEAD"],
+            capture_output=True, text=True, timeout=30,
+        ).stdout.strip()
+        pull = subprocess.run(
+            ["git", "-C", str(here), "pull", "--ff-only", "--quiet"],
+            capture_output=True, text=True, timeout=120,
+        )
+        if pull.returncode != 0:
+            LOG.warning("self-update: git pull failed: %s",
+                        (pull.stderr or pull.stdout).strip()[:200])
+            return False
+        after = subprocess.run(
+            ["git", "-C", str(here), "rev-parse", "HEAD"],
+            capture_output=True, text=True, timeout=30,
+        ).stdout.strip()
+        if before != after:
+            LOG.info("self-update: pulled %s → %s", before[:8], after[:8])
+            # EDIT: if you pin deps, re-run `pip install -r requirements.txt`
+            # here. Current requirements (requests, pyyaml) rarely change.
+            return True
+        LOG.info("self-update: already up to date.")
+        return False
+    except (subprocess.SubprocessError, OSError) as exc:
+        LOG.warning("self-update: skipped (%s).", exc)
+        return False
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="contract_monitor",
@@ -2427,6 +2487,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--email-test", action="store_true",
                    help="Send a test email (verifies SMTP creds; no SAM fetch).")
     p.add_argument("--no-sms", action="store_true", help="Force SMS disabled for this run.")
+    p.add_argument("--self-update", action="store_true",
+                   help="git pull --ff-only before running so cron stays current.")
     p.add_argument("--verbose", action="store_true", help="DEBUG-level logging.")
     return p
 
@@ -2438,6 +2500,15 @@ def main(argv: Optional[List[str]] = None) -> int:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
         datefmt="%Y-%m-%dT%H:%M:%S",
     )
+    if args.self_update:
+        # Re-exec the freshly pulled code so this same run uses the new version.
+        if self_update() and not os.environ.get("_CM_REEXECED"):
+            LOG.info("self-update: re-executing with updated code.")
+            os.environ["_CM_REEXECED"] = "1"
+            argv_next = [a for a in (argv if argv is not None else sys.argv[1:])
+                         if a != "--self-update"]
+            os.execv(sys.executable, [sys.executable, os.path.abspath(__file__)] + argv_next)
+
     cfg = load_config(Path(args.config))
     try:
         if args.email_test:

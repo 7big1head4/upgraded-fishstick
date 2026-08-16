@@ -13,14 +13,37 @@ Only `requests` + `pyyaml` are required.
 ## Quick start (Raspberry Pi 5)
 
 ```bash
+git clone https://github.com/7big1head4/upgraded-fishstick.git ~/contract
+cd ~/contract
+./install.sh                    # installs deps + daily cron in one shot
+```
+
+`install.sh` installs `requests`/`pyyaml`, writes a private `~/.sam_env` for
+your SAM key, and adds a daily cron job that self-updates before each run.
+Then finish setup:
+
+```bash
+# Get a free SAM.gov public API key (emailed instantly): https://api.data.gov/signup/
+nano ~/.sam_env                 # paste your SAM_API_KEY
+nano ~/contract/config.yaml     # keywords / NAICS / locations / email
+python3 contract_monitor.py --dry-run --lookback 5   # smoke test
+```
+
+Installer options:
+
+```bash
+./install.sh --time 05:30       # change the daily run time (24h local)
+./install.sh --dashboard        # also install the dashboard as a systemd service
+./install.sh --no-self-update   # cron won't git-pull before running
+./install.sh --uninstall        # remove the cron job (and dashboard service)
+```
+
+### Manual install
+
+```bash
 sudo apt-get install -y python3-pip sqlite3
 pip3 install --user -r requirements.txt
-
-# Get a free SAM.gov public API key (emailed instantly):
-#   https://api.data.gov/signup/
 export SAM_API_KEY=your_key_here
-
-# First run auto-creates config.yaml — edit keywords/NAICS/locations, then:
 python3 contract_monitor.py --update --lookback 30 --csv
 ```
 
@@ -34,9 +57,16 @@ reports/daily_YYYY-MM-DD.csv    # optional, sorted by actionability
 
 ## Daily cron
 
+`install.sh` writes this for you. `--self-update` does a `git pull --ff-only`
+first, so the Pi upgrades itself every morning before the run (skipped
+automatically if you have local edits):
+
 ```cron
-15 6 * * * . /home/pi/.sam_env && cd /home/pi/contract && /usr/bin/python3 contract_monitor.py --update --csv >> monitor.log 2>&1
+15 6 * * * . $HOME/.sam_env && cd $HOME/contract && /usr/bin/python3 contract_monitor.py --self-update --update --csv >> monitor.log 2>&1
 ```
+
+Run `python3 contract_monitor.py --self-update --update` any time to pull the
+latest code and run immediately.
 
 ## Live dashboard
 
@@ -98,6 +128,7 @@ header; enable with `sms_enabled: true` in `config.yaml`.
 --csv              Also write sorted CSV
 --serve            Start the always-on dashboard (--host/--port)
 --email-test       Send a test email to verify SMTP creds
+--self-update      git pull --ff-only before running (keeps cron current)
 --config/--db/--reports-dir/--lookback/--no-email/--no-sms/--verbose
 ```
 
